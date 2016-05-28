@@ -12,7 +12,7 @@ with a continuous integration process, such for dispatching payloads to the serv
 
 A call to slapy usually goes this way :
 =slapy pop -c machconfig -m 3 -s postpop.py=
-will instantiate a virtual machine defined in =VM/configVSI.py=
+will instantiate 3 servers defined in =VM/configVSI.py=
 #+begin_src python
 'tags': 'mach,foo' # the first one is the pool
 'domain': "domain.net",

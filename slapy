@@ -1,0 +1,677 @@
+#!/env/bin/python
+# Date:<2016/05/12 01:32:07>
+# author : phil estival <pestival@wearelearning.com>
+# This script is distributed under the terms of the GPL v2 license.
+# 
+# (de)commission multiple instances of server configurations
+# create ips pools grouped according to the first tag name
+# and performs post boot operations
+
+"""
+TODO
+- cache sl fetch
+- keep only twos files with ip hostname id :
+  pool.ips and pool.ips.new
+- handle multiple tags
+"""
+
+import os,sys,time,thread, signal, argparse
+import shutil, SoftLayer
+
+from threading import Thread, Lock
+from pprint import pprint
+from shell import ShellCommand as Shell
+from tput import *
+from checkrun import *
+
+from SoftLayer import VSManager, ImageManager, SoftLayerAPIError
+from SoftLayer.utils import lookup
+from SoftLayer.CLI import exceptions
+from SoftLayer.CLI.helpers import resolve_id
+from SoftLayer.CLI.formatting import (active_txn, transaction_status)
+
+
+sh=Shell()
+lock = Lock()
+# the list of ip that will be poped
+poped=[]
+HOST_DIR="./hosts"
+
+def signal_handler(signal, frame):
+	print('Break')
+	sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+def confirm( func, args ) :
+
+	if args.force :
+		func(args)
+	else:
+		sys.stdout.write('confirm : [Y] ')
+		choice = sys.stdin.read(1)
+		if choice == 'Y':
+			func (args)
+		else :
+			print 'canceled'
+
+
+def getvm(args,mask):
+    results = VSMan.list_instances(hostname=args.vm ,mask=mask )
+    if len(results)>1:
+        raise Exception("dup machine with hostname %s !" % args.vm)
+    if len(results) is 0 :
+        raise Exception("no such host %s" % args.vm)
+        #return None
+    return results[0]
+
+
+def showVM(args):
+    print args
+    mask = 'hostname,activeTransaction,primaryBackendIpAddress' if not args.debug else None
+    vm = getvm(args,mask)
+    pprint (vm)
+
+    if args.debug :
+        vsi = VSMan.get_instance(vm['id'])
+        pprint(vsi)
+
+
+def listVM(args) :
+    vm=tag=dc=None
+    if args.tag : tag=args.tag # take an array as params
+    if args.dc : dc=args.dc[0]
+    if args.vm : vm=args.vm[0]
+    if args.debug : mask=None
+    else: mask='hostname,primaryBackendIpAddress'
+
+    results = VSMan.list_instances(tags=tag,datacenter=dc,mask=mask,hostname=vm)
+    if debug :
+        pprint(results)
+    else :
+        for hosts in results: print ("%s %s") % (hosts['primaryBackendIpAddress'],hosts['hostname'])
+
+
+def captureVM( args ) :
+    vm = getvm(args,'id')
+    capture = VSMan.capture(vm['id'], args.vm, False, '' )
+
+
+def imageVM( args ) :
+    #vs_id = resolve_id(VSMan.resolve_ids, args.vm, 'VS')
+    vm = getvm(args,'id')
+    #print vm
+    capture = VSMan.capture(vm['id'], args.img[0], False, '' )
+
+
+def do_cancelVM(args) :
+	print "canceling...", args.vm
+	vs_id = resolve_id(VSMan.resolve_ids, args.vm, 'VS')
+	VSMan.cancel_instance(vs_id)
+	print args.vm, " (", vs_id, ") canceled"
+
+
+def cancelVM (args) :
+
+	if args.vm is None:
+		args.vm = pickVM(args)
+		print 'no vm specified'
+	print "about to cancel " , args.vm
+	confirm (do_cancelVM, args)
+	print args.vm , " canceled"
+
+
+def drypool(args):
+
+    #if args.multi :
+    multi = args.multi[0]
+    pool = args.pool
+    hosts = VSMan.list_instances(tags=[pool] ,mask='id,hostname,primaryBackendIpAddress')
+
+    if len(hosts)==0:
+        print "No such pool"
+        exit(1)
+
+    script=None
+    if args.script:
+        script = args.script[0]
+
+    # reverse sort the hosts by name
+    sortedHosts = sorted(hosts, key=lambda k: k['hostname'])[::-1]
+    print sortedHosts
+
+    threadz=[]
+
+    hosts = []
+    if multi==0: # means ALL hosts
+        hosts = sortedHosts[0:]
+        multi = len(sortedHosts) # set multi to the correct value (the number of hosts)
+        print "drying ALL servers from pool %s"%(multi,pool)
+    else:
+        hosts = sortedHosts[0:multi]
+    # servers to drop
+    for servers in hosts:
+            # find if theres any transac
+            #if servers['activeTransaction'] :
+            #    print 'cant drop %s. Pending transaction: %s'%(servers['hostname'], servers['activeTransaction'])
+            #    return
+            #else:
+            print "drop %s" % servers['hostname']
+            # not threaded:VSMan.cancel_instance(sortedHosts[x]['id'])
+            id = servers['id']
+            # threaded. multiple cancels :
+            t = Thread( target=VSMan.cancel_instance,args=( [id] ) )
+            threadz.append(t)
+
+    for t in threadz: t.start()
+    for t in threadz: t.join()
+
+    hostsips=[]
+    ips=[]
+    hostsipsfile = HOST_DIR+"/%s.iph" % pool
+    ipsfile = HOST_DIR+"/%s.ips" % pool
+    newipsfile = HOST_DIR+"/%s.new.ips" % pool
+    # remainder servers kepts
+    # todo : a function
+    for servers in sortedHosts[multi:] :
+        ip = servers['primaryBackendIpAddress']
+        hst = servers['hostname']
+        hostsips.append("%s %s" % (ip,hst) )
+        ips.append("%s" % ip)
+
+    with open(hostsipsfile, "w") as f : f.write("\n".join(hostsips)+"\n")
+    with open(ipsfile, "w") as f : f.write("\n".join(ips)+"\n")
+    # clean the new ips (delete perhaps)
+    with open(newipsfile, "w") as f : f.write("")
+
+    print "left if pool:"
+    print hostsips
+
+    if script:
+        # detach the process
+        os.execv(script, [script,pool])
+        sys.exit(0)
+
+
+def popVM(args) :
+    """
+    look for vm already tagged.
+    first tag = the machine pool name
+    pop a new hostname named hostN+1
+    clear sshkeys and pull the new ones
+    generate the (ip, host) list of these tagged VM
+    call a script at end './script poolname hostipfile'
+    """
+
+    print args
+    print ("Loading %s" % args.config)
+
+    n_instances = args.multi[0]
+    configfile = args.config[0]
+    configclass = args.configclass
+
+    serverConfig = getattr( __import__("VM."+configfile,
+        fromlist=[configclass]), configclass)
+    config = serverConfig.configParams
+
+    pprint( config )
+    tag = config['tags']
+    # first tag is the machine pool name
+    pool = config['tags'].split(',')[0]
+    # retrieve last image with the pool name
+    args.img = [ pool ]
+    config['image_id'] = lastImageId(args) or config['image_id']
+
+    hostsipsfile = HOST_DIR+"/%s.iph" % pool
+    ipsfile = HOST_DIR+"/%s.ips" % pool
+    newipsfile = HOST_DIR+"/%s.new.ips" % pool
+
+    print "pop into pool : %s" % pool
+
+    script=None
+    if args.script:
+        script = args.script[0]
+        with open(script,"r") : pass
+        print "will run %s %s" % (script,pool)
+
+    print "instanciate %i server in pool [ %s ] with tags (%s)"%(n_instances,pool,tag)
+
+    # list existing instances
+    hosts = VSMan.list_instances(tags=[pool] ,mask='hostname,primaryBackendIpAddress')
+    sys.stdout.write("VM tagged as %s : "%pool )
+    if len(hosts)==0 : sys.stdout.write (" None\n")
+    else:
+        print ''
+        for h in hosts: print "%s\t%s"%(h['primaryBackendIpAddress'],h['hostname'])
+
+    
+    # create the set of available host number
+    # consider N instances are always named h1..hN for now
+
+    # ---- Starts parallel instanciations ----
+    threadz = []
+    for i in xrange(n_instances) :
+        t = Thread(target=createVM,
+            args=(config, serverConfig.basehostname, len(hosts)+1+i ))
+        threadz.append(t)
+
+    for t in threadz: t.start()
+    for t in threadz: t.join()
+
+    # machines ready, list the pool
+    results = VSMan.list_instances(tags=[pool], mask='hostname,primaryBackendIpAddress')
+    # write host ip pairs
+    hostsips=[]
+    ips=[]
+    for hosts in results :
+        ip = hosts['primaryBackendIpAddress']
+        hst = hosts['hostname']
+        hostsips.append("%s %s" % (ip,hst) )
+        ips.append("%s" % ip)
+        # SSH PRINTS update
+        CheckRun("Replace SSH prints %s"%ip,'./ssh1st %s'% ip)
+
+    """ all files in the pool
+    file 1 (.iph): host ips pairs
+    file 2 (.ips): ips only
+        newly created
+    file (.ips.new)  ips only
+    """
+    with open(hostsipsfile, "w") as f : f.write("\n".join(hostsips)+"\n")
+    with open(ipsfile, "w") as f : f.write("\n".join(ips)+"\n")
+    with open(newipsfile, "w") as f : f.write("\n".join(poped)+"\n")
+
+    if script :
+        # detach the process
+        print "running %s %s" % (script,pool)
+        os.execv(script, [script,pool])
+        sys.exit(0)
+    
+def createVM( config,baseName, N ) :
+
+    hostname = config['hostname'] = baseName+str(N)
+    print "rising %s"% hostname
+
+    if args.debug:
+        from fixtures import newmach
+        IP = newmach['networkComponents'][0]['primaryIpAddress']
+        lock.acquire()
+        poped.append(IP)
+        lock.release()
+        pass
+
+    else:
+        result = VSMan.create_instance(**config)
+        # start monitoring until provisionning is over
+        args.vm = hostname
+        newmach = monitorVM( args )
+        lock.acquire()
+        poped.append( newmach['primaryBackendIpAddress'] )
+        lock.release()
+
+
+"""
+old static ordering for tests purposes
+"""
+def orderVM (args) :
+	global start_t
+	print "Ordering ", args.vm
+	createOpt = {
+		'datacenter' : {'name':args.dc[0]},
+		'hostname': args.vm,
+		'domain': 'wearelearning.com',
+		'startCpus': 1,
+		'maxMemory': 1024,
+		'localDiskFlag': 'false',
+	}
+
+	createOpt.update(cci)
+
+	if args.dc is 'ams01':
+		createOpt['primaryBackendNetworkComponent']={
+			'networkVlan': {"id": baseVS.vlan }
+		}
+
+	if not args.pub:
+		# the flag is TRUE if it appears,
+		# so don't try privateNetworkOnlyFlag=false
+		createOpt['privateNetworkOnlyFlag'] = 'true'
+	else :
+		print "with public network interface"
+
+	if args.month:
+		print "monthly"
+		createOpt['hourlyBillingFlag'] = 'false'
+	else:
+		print "hourly"
+		createOpt['hourlyBillingFlag'] = 'true'
+
+        if args.img:
+		print "instanciating from image"
+		img=args.img[0]
+		image_mgr = ImageManager(client)
+		# mask = 'id,accountId,name,globalIdentifier,blockDevices,parentId'
+		for image in image_mgr.list_private_images():
+			if image['name'] == img :
+				print image['name'], "/", image['globalIdentifier']
+				# retrieve image id 
+				# no images should holds the same name
+				createOpt['blockDeviceTemplateGroup'] = {"globalIdentifier": image['globalIdentifier']}
+				if args.debug:
+					print createOpt
+					print "vm not ordered (debug)"
+				else:
+					print "vm ordered"
+					client['Virtual_Guest'].createObject( createOpt )
+					monitorVM(args)
+				return
+
+		print "image %s not found" % img
+		return
+
+	else:
+		createOpt['operatingSystemReferenceCode'] = 'DEBIAN_LATEST_64'
+
+		if args.debug:
+			print createOpt
+		else:
+			client['Virtual_Guest'].createObject( createOpt )
+			monitorVM(args)
+
+
+def ready(args):
+    """Check if a virtual server is ready."""
+
+    vs_id = resolve_id(VSMan.resolve_ids, args.vm, 'VS')
+    ready = VSMan.wait_for_ready(vs_id,False)
+    if ready:
+        print("READY")
+    else:
+        print("not ready")
+
+
+
+def monitorVM(hostName) :
+
+    hostName = args.vm
+    start_t = time.time()
+
+    # assert hostname is unique
+    results = VSMan.list_instances(hostname=hostName ,mask=('hostname,id') )
+    if len(results)>1:
+        raise Exception("dup machine with hostname %s !" % hostName)
+    if len(results) is 0 :
+        print "no such host %s" %hostName
+        return None
+
+    vs_id = results[0]['id']
+    TRX = 'None'
+    TXN = 'None'
+    transaction=True
+    vm_ready=False;
+    guest=None
+
+    started = False
+    while not vm_ready or transaction :
+        try:
+            vm_ready = VSMan.wait_for_ready(vs_id, 1)
+            guest=VSMan.get_instance(
+                vs_id, mask='hostname,activeTransaction,primaryBackendIpAddress')
+        except SoftLayerAPIError, e:
+            print e
+        if not guest.get('activeTransaction'):
+            transaction = False
+	else :
+            TXN = guest['activeTransaction']['transactionStatus']\
+		.get('friendlyName') # or 'name' (shorter)
+            transaction=True
+
+	if TXN != TRX :
+            TRX=TXN
+            m, s = divmod((time.time()-start_t), 60)
+            print "%s [ %s ] %02d:%02d" %(TRX, hostName, m,s)
+            started =True
+	sys.stdout.write('.')
+	sys.stdout.flush()
+
+    t = time.time()-start_t
+    print "t = %02d:%02d" % divmod((time.time()-start_t), 60)
+    print "%s READY"%guest.get('hostname')
+
+    
+    #guest=VSMan.get_instance(vs_id)
+    pprint ( guest )
+    return guest
+
+# deprect
+
+def do_imageVM( args ) :
+
+	vs_id = resolve_id(VSMan.resolve_ids, args.vm, 'VS')
+	date=time.strftime("%Y-%m-%d_")
+	hour=time.strftime("%H.%M.%S")
+	note = date + hour + args.vm
+
+	print "about to create image ", args.img[0], note
+	capture = VSMan.capture(vs_id, args.img[0], False, note )
+	monitorVM(args)
+
+
+def imageVM0( args ) :
+	print "this will power off [", args.vm ,"] and create an image disk."
+	confirm( do_imageVM, args )
+
+
+
+# todo : put it into a cache file
+def listImagesVM(args):
+	global client
+	image_mgr = ImageManager(client)
+	#mask = 'id,accountId,name,globalIdentifier,bockDevices,parentId'
+	#images = []
+        images = image_mgr.list_private_images()
+	for image in images:
+		print "{0:<24s}{1:36s}  {2:27s}".format(image['name'],
+							image['globalIdentifier'],
+							image['createDate'])
+
+
+def lastImageId(args):
+    """
+    return the most recent image with that name
+    """
+    imgname = args.img[0]
+    image_mgr = ImageManager(client)
+    images = image_mgr.list_private_images(name=imgname)
+
+    if len(images) > 0:
+        lastImage = sorted(images, key=lambda k: k['createDate'])[::-1][0]
+
+        #print "last image : %s   %s"%(lastImage['globalIdentifier'], lastImage['createDate'])
+        print "from last image created at %s"% lastImage['createDate']
+        return lastImage['globalIdentifier']
+    else:
+        return None
+
+
+if __name__ == '__main__':
+
+    def positiveOrAll(value):
+        if value=='all':
+            return value
+        else:
+            ivalue = int(value)
+            if ivalue < 0:
+                raise argparse.ArgumentTypeError("%s must be positive" % value)
+            return ivalue
+
+    def positive_or_0(value):
+        ivalue = int(value)
+        if ivalue <= 0:
+            raise argparse.ArgumentTypeError("%s must be positive" % value)
+        return ivalue
+
+    start_t=0
+    parser = argparse.ArgumentParser( description="A farm management game.")
+
+    #argcomplete.autocomplete(parser)
+    sp = parser.add_subparsers()
+
+    host = argparse.ArgumentParser(add_help=False)
+    host.add_argument( 'vm', help='by hostname or vm id')
+
+    pool = argparse.ArgumentParser(add_help=False)
+    pool.add_argument( 'pool', help='by poolname or vm id')
+
+
+    vm = argparse.ArgumentParser(add_help=False)
+    vm.add_argument( '-vm', help='vm name',nargs=1, required=False)
+
+    tag = argparse.ArgumentParser(add_help=False)
+    tag.add_argument( '-tag', help='filter tag',nargs=1, required=False)
+
+    dc = argparse.ArgumentParser(add_help=False)
+    dc.add_argument('-dc', nargs=1,
+                help='datacenter (ams01,dal01,dal05,dal06,hkg02,sea01,sjc01,sng01,wdc01)',
+                required=False)
+
+    debug = argparse.ArgumentParser(add_help=False)
+    debug.add_argument( '-debug', action='store_true',
+                help='debug mode. No orders',
+                required=False)
+
+    sp_list = sp.add_parser('list',
+                parents=[vm,tag,dc,debug],
+                help='List VMs')
+
+    fromconfig = argparse.ArgumentParser(add_help=False)
+    fromconfig.add_argument( '-config', '-c',nargs=1,
+                help='config file (without.py)',
+                required=True)
+
+    fromconfigClass = argparse.ArgumentParser(add_help=False)
+    fromconfigClass.add_argument( '-configclass', nargs=1,
+                help='config name',
+                required=False,
+                default='ServerConfig')
+
+    arg=argparse.ArgumentParser
+
+    # number of instances to pop
+    multi = argparse.ArgumentParser(add_help=False)
+    multi.add_argument( '-multi','-m', nargs=1, type=positiveOrAll,
+                help='multiple instances. 0=ALL hosts',
+                required=False,
+                default=[1])
+
+    # script to run with pool.ips as argument
+    script = argparse.ArgumentParser(add_help=False)
+    script.add_argument( '-script','-s', nargs=1,
+                help='script to run afterward on this pool',
+                required=False)
+
+    command = argparse.ArgumentParser(add_help=False)
+    command.add_argument( '-command', nargs=1,
+                help='immediatly issue de following command',
+                required=False)
+
+
+    sp_popmachine = sp.add_parser('pop',
+                parents=[debug,multi,fromconfig,fromconfigClass,script],
+                help='order a vm')
+
+
+    sp_drypool = sp.add_parser('dry',
+                parents=[pool,debug,multi,script],
+                help='reduce a pool')
+
+    sp_capture = sp.add_parser('cap',
+                parents=[host],
+                help='image capture of a vm')
+
+    fromimg = argparse.ArgumentParser(add_help=False)
+    fromimg.add_argument( '-img', nargs=1,
+                help='image name',
+                required=False)
+
+    month = argparse.ArgumentParser(add_help=False)
+    month.add_argument( '-month', 
+                action='store_true',
+                help='order a monthly vm instead of default hourly',
+                required=False)
+
+    pubnet = argparse.ArgumentParser(add_help=False)
+    pubnet.add_argument( '-pub', action='store_true',
+                help='order a vm with a public interface',
+                required=False)
+
+    sp_order = sp.add_parser('order', parents=[host,fromimg,pubnet,month,debug,dc], help='order a vm')
+
+    force = argparse.ArgumentParser(add_help=False)
+    force.add_argument( '-f',
+                dest='force',
+                action='store_true',
+                help='print details',
+                required=False)
+
+    sp_cancel = sp.add_parser('cancel',
+                parents=[host,force],
+                description='cancel a vm',
+                help='cancel a vm')
+
+    sp_connect = sp.add_parser('connect', parents=[host],
+                help='open a shell on the host')
+
+    dump = argparse.ArgumentParser(add_help=False)
+    dump.add_argument( '-dump',
+                dest='dump',
+                action='store_true',
+                help='print details',
+                required=False)
+
+    sp_monitor  = sp.add_parser('monitor', parents=[host,dump],
+                help='monitor active transactions')
+
+    sp_show  = sp.add_parser('show', parents=[host,debug],
+                help='show VM')
+
+    imgname = argparse.ArgumentParser(add_help=False)
+    imgname.add_argument( '-img', nargs=1,
+                help='image name',
+                required=True)
+
+    sp_image =  sp.add_parser('image',
+                help='Create a new image from the data disk')
+
+    spim = sp_image.add_subparsers()
+
+    sp_img_create =  spim.add_parser('create',
+                parents=[host, force, imgname ],
+                help='Create a new image from the data disk')
+
+    sp_img_list =  spim.add_parser('list',
+                help='list image disk')
+
+    sp_img_last =  spim.add_parser('last',
+                parents=[ imgname ],
+                help='return most recent imagae with that name')
+
+    sp_show.set_defaults        (func=showVM)
+    sp_list.set_defaults        (func=listVM)
+    sp_order.set_defaults       (func=orderVM)
+    sp_popmachine.set_defaults  (func=popVM)
+    sp_drypool.set_defaults     (func=drypool)
+    sp_capture.set_defaults     (func=captureVM)
+    sp_cancel.set_defaults      (func=cancelVM)
+    sp_monitor.set_defaults     (func=monitorVM)
+    sp_img_create.set_defaults  (func=imageVM)
+    sp_img_list.set_defaults    (func=listImagesVM)
+    sp_img_last.set_defaults    (func=lastImageId)
+
+    args = parser.parse_args()
+
+    client = SoftLayer.Client()
+    VSMan = VSManager(client)
+
+    args.func(args)
+
