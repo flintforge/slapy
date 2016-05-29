@@ -1,0 +1,18 @@
+
+backend BK2
+   balance roundrobin
+
+   option tcp-smart-connect
+   option splice-response
+
+	appsession JSESSIONID len 120 timeout 360min request-learn
+
+   option httpchk HEAD / HTTP/1.0
+   no option log-health-checks
+   http-check disable-on-404
+   http-check expect status 200
+
+   acl being_scanned be_sess_rate gt 500
+   redirect location /denied.html if being_scanned
+
+

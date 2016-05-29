@@ -1,0 +1,13 @@
+
+backend BK1
+   balance roundrobin
+   option httpchk HEAD /healthcheck/database HTTP/1.0
+   no option log-health-checks
+   http-check disable-on-404
+   http-check expect status 200
+   acl being_scanned be_sess_rate gt 100
+   redirect location /denied.html if being_scanned
+
+   option tcp-smart-connect
+   option splice-response
+
