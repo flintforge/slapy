@@ -73,5 +73,6 @@ Making a symbolic =haproxy/hosts/server.ips= link to a file =slapy/hosts/server.
 will make the new instances recorded in the haproxy configuration when it's regenerated.
 
 ** munin configuration
-The hostnames in slapy are generated as poolN where N is the number of machines
+The hostnames in slapy are generated as poolN where N is the number of machines.
+The hosts must be already configured to be munin-nodes.
 
