@@ -14,7 +14,7 @@ A call to slapy usually goes this way :
 =slapy pop -c machconfig -m 3 -s postpop.py=
 will instantiate 3 servers defined in =VM/configVSI.py=
 #+begin_src python
-sshkeys = [000000,000001]
+sshkeys = [00001,00002]
 class ServerConfig :
   configParams = {
     'tags': 'mach,foo' # the first one is the pool
